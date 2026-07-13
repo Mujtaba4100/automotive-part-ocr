@@ -16,6 +16,7 @@ Windows.  Pin to the 2.x line (see requirements.txt).
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 import numpy as np
@@ -38,6 +39,7 @@ class OCRService:
 
     def __init__(self) -> None:
         """Initialise and warm-up the PaddleOCR engine."""
+        self._lock = threading.Lock()
         log.info("Initialising PaddleOCR engine …")
         try:
             # use_angle_cls=True  → detects rotated text automatically
@@ -135,6 +137,63 @@ class OCRService:
 
         return results
 
+    def detect_text_regions(self, image: np.ndarray) -> list[list[list[float]]]:
+        """Detect text bounding box quadrilaterals in *image*.
+        
+        Args:
+            image: ``uint8`` NumPy array (H × W × 3, RGB).
+
+        Returns:
+            List of bounding box quadrilaterals: [[[x0,y0], [x1,y1], [x2,y2], [x3,y3]], ...]
+        """
+        with self._lock:
+            try:
+                raw = self._engine.ocr(image, det=True, rec=False, cls=True)
+                if not raw:
+                    return []
+                
+                boxes = []
+                for item in raw:
+                    if not item:
+                        continue
+                    # Handle raw formatting variations
+                    if isinstance(item, list) and len(item) == 2 and isinstance(item[1], tuple):
+                        boxes.append(item[0])
+                    else:
+                        boxes.append(item)
+                return boxes
+            except Exception as exc:
+                log.error("Text region detection failed: %s", exc)
+                return []
+
+    def recognise_region(self, crop: np.ndarray) -> list[tuple[str, float]]:
+        """Run OCR recognition on a pre-detected cropped region, bypassing detection.
+        
+        Args:
+            crop: ``uint8`` cropped image array (H × W × 3, RGB).
+
+        Returns:
+            List of (text, confidence) tuples.
+        """
+        with self._lock:
+            try:
+                raw = self._engine.ocr(crop, det=False, rec=True, cls=True)
+                if not raw:
+                    return []
+                
+                results = []
+                # PaddleOCR det=False output can vary; recursively extract string-confidence pairs
+                def extract(item):
+                    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str):
+                        results.append((item[0].strip(), float(item[1])))
+                    elif isinstance(item, list):
+                        for sub in item:
+                            extract(sub)
+                extract(raw)
+                return results
+            except Exception as exc:
+                log.error("Region recognition failed: %s", exc)
+                return []
 
     # ---------------------------------------------------------------- #
     # Private helpers                                                   #
@@ -152,11 +211,12 @@ class OCRService:
               …
             ]
         """
-        try:
-            return self._engine.ocr(image, cls=True)
-        except Exception as exc:  # noqa: BLE001
-            log.error("OCR inference error: %s", exc)
-            return None
+        with self._lock:
+            try:
+                return self._engine.ocr(image, cls=True)
+            except Exception as exc:  # noqa: BLE001
+                log.error("OCR inference error: %s", exc)
+                return None
 
     @staticmethod
     def _extract_text(detection: object) -> str:

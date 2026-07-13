@@ -60,10 +60,14 @@ BLACKLIST: list[str] = [
 
 # Regex patterns for matching common automotive part formats (after normalization)
 SUPPORTED_PATTERNS: list[str] = [
-    r"^[A-Z]\d{10}$",              # Mercedes-Benz (e.g. A2076800489)
-    r"^A2C\d{8}$",                 # VDO/Continental (e.g. A2C53420732)
-    r"^\d[A-Z0-9]{2}\d{6}[A-Z]?$", # VAG V1 (e.g. 1K0820803J, 8K0959455N, 4F0820743A)
-    r"^\d{2}[A-Z]\d{6}[A-Z]?$",    # VAG V2 (e.g. 03L906023)
-    r"^\d{11}$",                   # BMW 11-digit (e.g. 51717070509)
-    r"^[A-Z0-9]{9,12}$"            # General fallback alphanumeric part number structure
+    r"^[A-Z]\d{10}$",                    # Mercedes-Benz (e.g. A2076800489)
+    r"^A2C\d{8}$",                       # VDO/Continental (e.g. A2C53420732)
+    r"^\d[A-Z0-9]{2}\d{6}[A-Z]{0,2}$",   # VAG V1 (e.g. 1K0820803J, 8K0959455N, 4F0820743A)
+    r"^\d{2}[A-Z]\d{6}[A-Z]{0,2}$",      # VAG V2 (e.g. 03L906023)
+    r"^\d{11}$",                         # BMW 11-digit (e.g. 51717070509)
+    r"^\d{10}$",                         # Toyota, Bosch, Denso, ZF (10-digit numeric)
+    r"^\d{5}[A-Z0-9]{6}$",               # Honda (11-digit alphanumeric)
+    r"^[A-Z0-9]{2,6}\d{4,6}[A-Z]{1,3}$", # Ford (e.g. 6G9112K072AD)
+    r"^\d{6}$",                          # Valeo (6-digit numeric)
+    r"^[A-Z0-9]{9,12}$"                  # General fallback alphanumeric part number structure
 ]

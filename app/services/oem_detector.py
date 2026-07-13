@@ -3,7 +3,7 @@ oem_detector.py
 ---------------
 Dedicated detector for extracting and validating automotive OEM part numbers
 using regular expressions, token normalization, blacklists, and a heuristic
-multi-factor confidence scoring model.
+multi-factor confidence fusion system.
 """
 
 from __future__ import annotations
@@ -46,17 +46,7 @@ class OEMDetector:
         return normalized_text in self._normalized_blacklist
 
     def calculate_confidence(self, normalized: str, ocr_conf: float) -> float:
-        """Compute a multi-factor confidence score for a normalized part number candidate.
-
-        Scores are based on:
-          1. OCR engine confidence
-          2. Regular expression match quality (specific patterns vs fallback)
-          3. Character composition (alphanumeric vs purely letters/digits)
-          4. String length
-
-        Returns:
-            Confidence value in range [0.0, 1.0].
-        """
+        """Compute a basic multi-factor confidence score for a single detection."""
         if not normalized or len(normalized) < 3:
             return 0.0
 
@@ -67,7 +57,7 @@ class OEMDetector:
         pattern_score = 0.0
         matched_any = False
 
-        # Try specific patterns first (Mercedes, VDO, VAG V1, VAG V2)
+        # Try specific patterns first (Mercedes, VDO, VAG V1, VAG V2, BMW, Toyota, Honda, Ford, Valeo)
         for pattern in self._compiled_patterns[:-1]:
             if pattern.match(normalized):
                 pattern_score = 1.0
@@ -111,29 +101,14 @@ class OEMDetector:
         return min(max(conf, 0.0), 1.0)
 
     def detect(self, detections: list[tuple[str, float]]) -> tuple[bool, list[str], float]:
-        """Process OCR detections and find the most probable OEM part numbers.
-
-        Args:
-            detections: List of (text_string, ocr_confidence) tuples.
-
-        Returns:
-            A tuple of (detected, matched_numbers, highest_confidence).
-        """
+        """Legacy detection method. Keep for simple verification scripts."""
         matches: list[tuple[str, float]] = []
 
         for text, ocr_conf in detections:
             if ocr_conf < OCR_CONFIDENCE_THRESHOLD:
                 continue
 
-            # Split only by:
-            # - Pipes: |
-            # - Slashes/backslashes: /, \
-            # - Two or more consecutive spaces: \s{2,}
-            # - Newlines/tabs
-            # This allows single spaces (e.g. "A207 6800489") to remain together.
             tokens = re.split(r"[\t\n\r|\\/]+|\s{2,}", text)
-            
-            # Also evaluate the entire raw text line as a fallback candidate
             candidates = list(tokens)
             if len(tokens) > 1:
                 candidates.append(text)
@@ -152,7 +127,6 @@ class OEMDetector:
         if not matches:
             return False, [], 0.0
 
-        # Sort matches by confidence descending
         matches.sort(key=lambda x: x[1], reverse=True)
         unique_numbers: list[str] = []
         for num, _ in matches:
@@ -161,3 +135,111 @@ class OEMDetector:
 
         highest_confidence = matches[0][1]
         return True, unique_numbers, highest_confidence
+
+    def detect_fused(self, raw_detections: list[dict]) -> tuple[bool, list[str], float, dict[str, float], dict[str, tuple[str, int]]]:
+        """Process multiple raw detections and apply Phase 3 Confidence Fusion.
+
+        Args:
+            raw_detections: List of dicts, each with keys:
+                "text" (str)
+                "ocr_conf" (float)
+                "rotation" (int)
+                "preprocess" (str)
+                "scale" (float)
+                "is_crop" (bool)
+
+        Returns:
+            Tuple: (detected: bool, matched_numbers: list[str], highest_conf: float,
+                    confidences_map: dict[str, float], metadata_map: dict[str, tuple[str, int]])
+        """
+        candidates_map: dict[str, list[dict]] = {}
+
+        # ── 1. Gather and Clean Candidates ─────────────────────────── #
+        for det in raw_detections:
+            text = det["text"]
+            ocr_conf = det["ocr_conf"]
+            if ocr_conf < OCR_CONFIDENCE_THRESHOLD:
+                continue
+
+            tokens = re.split(r"[\t\n\r|\\/]+|\s{2,}", text)
+            candidates = list(tokens)
+            if len(tokens) > 1:
+                candidates.append(text)
+
+            for token in candidates:
+                token_clean = token.strip().strip("> < [ ] ( )")
+                if not token_clean:
+                    continue
+
+                normalized = self.normalize(token_clean)
+                if self.is_blacklisted(normalized) or len(normalized) < 3:
+                    continue
+
+                if normalized not in candidates_map:
+                    candidates_map[normalized] = []
+                candidates_map[normalized].append(det)
+
+        # ── 2. Run Confidence Fusion Scoring ───────────────────────── #
+        fused_matches: list[tuple[str, float, str, int]] = []
+
+        for normalized, detections in candidates_map.items():
+            ocr_confs = [d["ocr_conf"] for d in detections]
+            ocr_base = max(ocr_confs) if ocr_confs else 0.0
+
+            # Determine regex pattern match score
+            pattern_score = 0.0
+            matched_any = False
+            for pattern in self._compiled_patterns[:-1]:
+                if pattern.match(normalized):
+                    pattern_score = 1.0
+                    matched_any = True
+                    break
+
+            if not matched_any:
+                fallback_pattern = self._compiled_patterns[-1]
+                if fallback_pattern.match(normalized):
+                    pattern_score = 0.7
+                    matched_any = True
+
+            # If it matches absolutely no configured pattern, reject it
+            if not matched_any:
+                continue
+
+            # Agreement score (frequency of detection)
+            num_detections = len(detections)
+            agreement_score = min(1.0, 0.4 + (num_detections - 1) * 0.15)
+
+            # Rotation agreement (diversity of angles)
+            unique_rotations = {d["rotation"] for d in detections}
+            rotation_score = min(1.0, 0.5 + (len(unique_rotations) - 1) * 0.5)
+
+            # Preprocessing agreement (diversity of pipelines)
+            unique_preprocesses = {d["preprocess"] for d in detections}
+            preprocess_score = min(1.0, 0.5 + (len(unique_preprocesses) - 1) * 0.25)
+
+            # Weights: OCR base (50%), agreement (15%), rotation (15%), preprocess (20%)
+            factor_score = (ocr_base * 0.50) + (agreement_score * 0.15) + (rotation_score * 0.15) + (preprocess_score * 0.20)
+            fused_conf = pattern_score * factor_score
+            fused_conf = min(max(fused_conf, 0.0), 1.0)
+
+            if fused_conf >= OEM_CONFIDENCE_THRESHOLD:
+                # Find the rotation, preprocess, and scale that gave the highest base OCR confidence for logging
+                best_det = max(detections, key=lambda d: d["ocr_conf"])
+                best_preprocess = best_det["preprocess"]
+                best_rotation = best_det["rotation"]
+                best_scale = best_det["scale"]
+                fused_matches.append((normalized, fused_conf, best_preprocess, best_rotation, best_scale))
+
+        if not fused_matches:
+            return False, [], 0.0, {}, {}
+
+        # Sort matches by confidence descending
+        fused_matches.sort(key=lambda x: x[1], reverse=True)
+
+        matched_numbers = [m[0] for m in fused_matches]
+        highest_confidence = fused_matches[0][1]
+        
+        confidences_map = {m[0]: m[1] for m in fused_matches}
+        metadata_map = {m[0]: (m[2], m[3], m[4]) for m in fused_matches} # best (preprocess, rotation, scale)
+
+        return True, matched_numbers, highest_confidence, confidences_map, metadata_map

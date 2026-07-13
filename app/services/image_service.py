@@ -231,3 +231,137 @@ def get_ocr_candidates(image: np.ndarray) -> list[dict[str, object]]:
 
     return candidates
 
+
+# ------------------------------------------------------------------ #
+# Advanced Image Preprocessing & Warping (Phase 3)                  #
+# ------------------------------------------------------------------ #
+
+def crop_and_warp(image: np.ndarray, box: list[list[float]]) -> np.ndarray:
+    """Crop and apply perspective correction to warp a quadrilateral box into a flat rectangle.
+    
+    Args:
+        image: Source RGB NumPy array.
+        box: A list of 4 points: [[x0, y0], [x1, y1], [x2, y2], [x3, y3]]
+             ordered top-left, top-right, bottom-right, bottom-left.
+             
+    Returns:
+        Warped crop as an RGB NumPy array.
+    """
+    try:
+        pts = np.array(box, dtype=np.float32)
+        # TL, TR, BR, BL
+        tl, tr, br, bl = pts[0], pts[1], pts[2], pts[3]
+
+        # Calculate width
+        width_a = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        width_b = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        max_width = max(int(width_a), int(width_b))
+
+        # Calculate height
+        height_a = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+        height_b = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+        max_height = max(int(height_a), int(height_b))
+
+        if max_width <= 0 or max_height <= 0:
+            # Fallback to simple bounding box crop if warping calculations are invalid
+            x_coords = [p[0] for p in box]
+            y_coords = [p[1] for p in box]
+            x0, x1 = int(min(x_coords)), int(max(x_coords))
+            y0, y1 = int(min(y_coords)), int(max(y_coords))
+            h, w = image.shape[:2]
+            x0, x1 = max(0, x0), min(w, x1)
+            y0, y1 = max(0, y0), min(h, y1)
+            return image[y0:y1, x0:x1].copy()
+
+        dst = np.array([
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1]
+        ], dtype=np.float32)
+
+        M = cv2.getPerspectiveTransform(pts, dst)
+        return cv2.warpPerspective(image, M, (max_width, max_height))
+    except Exception as exc:
+        log.warning("Perspective warp failed: %s", exc)
+        # Return fallback bounding box crop
+        try:
+            x_coords = [p[0] for p in box]
+            y_coords = [p[1] for p in box]
+            x0, x1 = int(min(x_coords)), int(max(x_coords))
+            y0, y1 = int(min(y_coords)), int(max(y_coords))
+            h, w = image.shape[:2]
+            return image[max(0, y0):min(h, y1), max(0, x0):min(w, x1)].copy()
+        except Exception:
+            return image
+
+
+def adjust_gamma(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+    """Apply gamma correction to enhance low-light or over-exposed text."""
+    try:
+        invGamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+        return cv2.LUT(image, table)
+    except Exception as exc:
+        log.warning("Gamma correction failed: %s", exc)
+        return image
+
+
+def normalize_brightness(image: np.ndarray) -> np.ndarray:
+    """Normalize image brightness using min-max scaling."""
+    try:
+        return cv2.normalize(image, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    except Exception as exc:
+        log.warning("Brightness normalization failed: %s", exc)
+        return image
+
+
+def upscale_image(image: np.ndarray, scale: float) -> np.ndarray:
+    """Upscale image by a scale factor using bicubic interpolation."""
+    if scale == 1.0:
+        return image
+    try:
+        h, w = image.shape[:2]
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    except Exception as exc:
+        log.warning("Upscaling failed: %s", exc)
+        return image
+
+
+def get_advanced_enhancements(crop: np.ndarray) -> list[dict[str, object]]:
+    """Generate multiple preprocessed variations of a cropped text region.
+    
+    Returns:
+        A list of dictionaries containing the enhancement 'pipeline' description 
+        and the processed crop image.
+    """
+    enhancements = []
+    
+    # 1. Original crop
+    enhancements.append({"pipeline": "Original", "image": crop})
+
+    # 2. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    enhancements.append({"pipeline": "CLAHE", "image": enhance_clahe(crop)})
+
+    # 3. Sharpened
+    enhancements.append({"pipeline": "Sharpened", "image": sharpen_image(crop)})
+
+    # 4. Bilateral Denoised
+    enhancements.append({"pipeline": "BilateralFilter", "image": denoise_image(crop)})
+
+    # 5. Brightness Normalized
+    enhancements.append({"pipeline": "Normalised", "image": normalize_brightness(crop)})
+
+    # 6. Adaptive Threshold (Binarized + Morphology)
+    thresh = morphological_cleanup(adaptive_threshold(crop))
+    enhancements.append({"pipeline": "Thresholded", "image": thresh})
+
+    # 7. Gamma Corrected (High contrast / shadow recovery)
+    enhancements.append({"pipeline": "GammaHigh", "image": adjust_gamma(crop, 1.5)})
+    enhancements.append({"pipeline": "GammaLow", "image": adjust_gamma(crop, 0.6)})
+
+    return enhancements
+
+
