@@ -263,7 +263,10 @@ class CompletionDialog(QDialog):
 
     def _open_folder(self) -> None:
         try:
-            os.startfile(self._output_folder)
+            if self._output_folder.exists():
+                os.startfile(self._output_folder)
+            elif self._output_folder.parent.exists():
+                os.startfile(self._output_folder.parent)
         except Exception as exc:
             log.error("Failed to open output directory: %s", exc)
         self.accept()
@@ -538,13 +541,11 @@ class MainWindow(QMainWindow):
         """Open copied files output location."""
         if self._selected_folder:
             output_dir = self._selected_folder / "Number_Photos"
-            if output_dir.exists():
-                try:
-                    os.startfile(output_dir)
-                except Exception as exc:
-                    QMessageBox.warning(self, "Folder Error", f"Failed to open destination: {exc}")
-            else:
-                QMessageBox.warning(self, "Missing Directory", "Output directory has not been created yet.")
+            target_dir = output_dir if output_dir.exists() else self._selected_folder
+            try:
+                os.startfile(target_dir)
+            except Exception as exc:
+                QMessageBox.warning(self, "Folder Error", f"Failed to open directory: {exc}")
 
     @Slot()
     def _on_clear_log(self) -> None:

@@ -148,19 +148,20 @@ class OCRService:
         """
         with self._lock:
             try:
-                raw = self._engine.ocr(image, det=True, rec=False, cls=True)
-                if not raw:
+                # Bypass buggy raw wrapper by calling direct text detector
+                res = self._engine.text_detector(image)
+                if res is None or not isinstance(res, tuple) or len(res) < 2:
+                    return []
+                
+                dt_boxes, elapse = res
+                if dt_boxes is None:
                     return []
                 
                 boxes = []
-                for item in raw:
-                    if not item:
+                for box in dt_boxes:
+                    if box is None:
                         continue
-                    # Handle raw formatting variations
-                    if isinstance(item, list) and len(item) == 2 and isinstance(item[1], tuple):
-                        boxes.append(item[0])
-                    else:
-                        boxes.append(item)
+                    boxes.append(box.tolist())
                 return boxes
             except Exception as exc:
                 log.error("Text region detection failed: %s", exc)
@@ -178,7 +179,7 @@ class OCRService:
         with self._lock:
             try:
                 raw = self._engine.ocr(crop, det=False, rec=True, cls=True)
-                if not raw:
+                if raw is None:
                     return []
                 
                 results = []
