@@ -2,20 +2,15 @@
 folder_worker.py
 ----------------
 Background QThread worker that drives the complete processing pipeline
-(scan → load → OCR → copy) without ever blocking the GUI event loop.
-
-Signals emitted to the main window
-------------------------------------
-progress(int)           – 0-100 percentage for the progress bar
-log_message(str)        – human-readable status line for the log widget
-stats_update(int, int, int)
-                        – (total, processed, detected) counter tuple
-finished(bool)          – True = completed normally, False = cancelled
+(scan → load → OCR → copy) in parallel without blocking the GUI event loop.
+Optimized for high-throughput, low-latency, and caching.
 """
 
 from __future__ import annotations
 
+import os
 import time
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -26,7 +21,7 @@ from app.services.file_service import FileService
 from app.services.image_service import load_and_correct
 from app.services.ocr_service import OCRService
 from app.services.oem_detector import OEMDetector
-from app.utils.constants import OEM_CONFIDENCE_THRESHOLD, MAX_WORKERS
+from app.utils.constants import OEM_CONFIDENCE_THRESHOLD
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -60,6 +55,10 @@ class FolderWorker(QThread):
         self._detector: OEMDetector = OEMDetector()
         self._cancel_requested: bool = False
 
+        # SHA256 duplicate image cache & lock
+        self._cache: dict[str, dict] = {}
+        self._cache_lock = threading.Lock()
+
     # ---------------------------------------------------------------- #
     # Public control                                                    #
     # ---------------------------------------------------------------- #
@@ -76,6 +75,7 @@ class FolderWorker(QThread):
     def run(self) -> None:
         """Main processing loop – executed in the background thread."""
         self._cancel_requested = False
+        run_start_time = time.perf_counter()
 
         # ── 1. Scan for images ────────────────────────────────────── #
         self._emit_log("Scanning folder for images …")
@@ -110,8 +110,11 @@ class FolderWorker(QThread):
         detected = 0
         stats_lock = threading.Lock()
 
-        # We submit to a ThreadPoolExecutor with MAX_WORKERS threads
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Calculate optimal thread count: min(cpu_count, 6)
+        num_workers = min(os.cpu_count() or 1, 6)
+        self._emit_log(f"Starting parallel engine pool with {num_workers} threads...")
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
             # Create a dict mapping future objects to their index and image path
             futures = {
                 executor.submit(self._process_image, img_path, output_folder): (idx, img_path)
@@ -144,91 +147,174 @@ class FolderWorker(QThread):
                         self.stats_update.emit(total, processed, detected)
 
         # ── 4. Done ───────────────────────────────────────────────── #
+        total_time = time.perf_counter() - run_start_time
+        avg_time = total_time / processed if processed > 0 else 0.0
+        images_per_sec = processed / total_time if total_time > 0 else 0.0
+
         self._emit_log(
-            f"\n✅ Finished! Processed {processed}/{total} images. "
-            f"Detected: {detected} image(s) copied to Number_Photos/."
+            f"\n✅ Finished! Processed {processed}/{total} images.\n"
+            f"Detected: {detected} image(s) copied to Number_Photos/.\n"
+            f"Total runtime: {total_time:.2f}s\n"
+            f"Average time per image: {avg_time:.2f}s\n"
+            f"Throughput: {images_per_sec:.2f} images/second"
         )
         self.finished.emit(True)
 
     def _process_image(self, image_path: Path, output_folder: Path) -> dict:
-        """Process a single image through the complete Phase 3 pipeline."""
+        """Process a single image through the optimized Phase 3 pipeline."""
         start_time = time.perf_counter()
         result = {
             "detected": False,
             "matched_numbers": [],
             "highest_confidence": 0.0,
             "copied": False,
-            "log": ""
+            "log": "",
+            "duration": 0.0
         }
 
-        # Load image & correct EXIF
+        # ── 1. Hashing Check ───────────────────────────────────────── #
+        file_hash = self._calculate_sha256(image_path)
+        with self._cache_lock:
+            cached = self._cache.get(file_hash)
+
+        if cached is not None:
+            if cached["detected"]:
+                result["detected"] = True
+                result["matched_numbers"] = cached["matched_numbers"]
+                result["highest_confidence"] = cached["highest_confidence"]
+                
+                copied = FileService.copy_image(image_path, output_folder)
+                result["copied"] = copied
+                copied_status = "Copied to Number_Photos/" if copied else "Copy failed"
+                
+                oem_lines = "\n".join(f"  - {num}" for num in result["matched_numbers"])
+                result["log"] = (
+                    f"  ✓ (Cache Hit) Duplicate image\n"
+                    f"  Numbers:\n"
+                    f"{oem_lines}\n"
+                    f"  Confidence: {result['highest_confidence']:.2f} (Fused)\n"
+                    f"  → {copied_status}"
+                )
+            else:
+                result["log"] = "  ✗ (Cache Hit) Duplicate image (No OEM number detected)"
+            
+            result["duration"] = time.perf_counter() - start_time
+            return result
+
+        # ── 2. Load & Correct EXIF ─────────────────────────────────── #
         image_array = load_and_correct(image_path)
         if image_array is None:
             result["log"] = "  ✗ Could not read or decode image."
+            result["duration"] = time.perf_counter() - start_time
             return result
+
+        # ── 3. Run Region Detection (Once on base image layout) ────── #
+        boxes = self._ocr.detect_text_regions(image_array)
 
         raw_detections = []
         found_confident_match = False
 
-        from app.services.image_service import rotate_image, upscale_image, crop_and_warp, get_advanced_enhancements
+        from app.services.image_service import (
+            crop_and_warp, upscale_image, enhance_clahe, sharpen_image,
+            adaptive_threshold, morphological_cleanup, denoise_image, adjust_gamma
+        )
 
-        # Multi-scale & multi-rotation candidate generator
-        # Try 1.0x scale (normal), then 1.5x, then 2.0x
-        for scale in [1.0, 1.5, 2.0]:
-            if found_confident_match or self._cancel_requested:
+        # ── 4. First Pass: Original Crops & Smart Upscaling ───────── #
+        from app.services.image_service import rotate_image
+        for box in boxes:
+            if self._cancel_requested:
                 break
 
-            scaled_img = upscale_image(image_array, scale)
+            crop = crop_and_warp(image_array, box)
+            crop_h = crop.shape[0]
+            crop_w = crop.shape[1]
 
-            # Test rotations: 0°, 180°, 90°, 270°
-            for rotation in [0, 180, 90, 270]:
+            # Aspect ratio rotation check: test vertical rotations if vertical box
+            rotations = [90, 270] if crop_h > crop_w else [0]
+            text_thickness = crop_w if crop_h > crop_w else crop_h
+
+            # Smart upscaling: only scale small crops (thickness < 30 pixels)
+            scales = [1.0, 1.5, 2.0] if text_thickness < 30 else [1.0]
+
+            for rot in rotations:
+                rotated_crop = rotate_image(crop, rot)
+                for sc in scales:
+                    scaled_crop = upscale_image(rotated_crop, sc)
+                    recs = self._ocr.recognise_region(scaled_crop)
+                    for text, conf in recs:
+                        raw_detections.append({
+                            "text": text,
+                            "ocr_conf": conf,
+                            "rotation": rot,
+                            "preprocess": "Original",
+                            "scale": sc,
+                            "is_crop": True
+                        })
+
+        # Run Fallback: Full base image OCR
+        if not self._cancel_requested:
+            fallback_recs = self._ocr.extract_all_text_with_confidences(image_array)
+            for text, conf in fallback_recs:
+                raw_detections.append({
+                    "text": text,
+                    "ocr_conf": conf,
+                    "rotation": 0,
+                    "preprocess": "FullImage",
+                    "scale": 1.0,
+                    "is_crop": False
+                })
+
+        # Evaluate current detections
+        det_ok, matched, highest_c, conf_map, meta_map = self._detector.detect_fused(raw_detections)
+        if det_ok and highest_c >= 0.90:
+            found_confident_match = True
+
+        # ── 5. Second Pass: Lazy Preprocessing Pipelines ─────────────── #
+        if not found_confident_match and not self._cancel_requested:
+            # We try the 3 most effective enhancements one-by-one: CLAHE, Sharpen, Thresholded
+            enhancement_types = [
+                ("CLAHE", lambda c: enhance_clahe(c)),
+                ("Sharpened", lambda c: sharpen_image(c)),
+                ("Thresholded", lambda c: morphological_cleanup(adaptive_threshold(c)))
+            ]
+
+            for name, pipeline_func in enhancement_types:
                 if found_confident_match or self._cancel_requested:
                     break
 
-                rotated_img = rotate_image(scaled_img, rotation)
-
-                # A) Crop perspective-corrected region boxes (automatic region detection)
-                boxes = self._ocr.detect_text_regions(rotated_img)
                 for box in boxes:
                     if self._cancel_requested:
                         break
 
-                    crop = crop_and_warp(rotated_img, box)
-                    # Advanced Preprocessing (CLAHE, thresholding, denoising, sharpening, gamma, norm)
-                    enhancements = get_advanced_enhancements(crop)
+                    crop = crop_and_warp(image_array, box)
+                    crop_h = crop.shape[0]
+                    crop_w = crop.shape[1]
+
+                    # Aspect ratio rotation check
+                    rotations = [90, 270] if crop_h > crop_w else [0]
+                    text_thickness = crop_w if crop_h > crop_w else crop_h
+
+                    # Process enhancement
+                    enhanced_crop = pipeline_func(crop)
                     
-                    for enh in enhancements:
-                        if self._cancel_requested:
-                            break
+                    # Scale if necessary
+                    scales = [1.0, 1.5, 2.0] if text_thickness < 30 else [1.0]
+                    for rot in rotations:
+                        rotated_enhanced = rotate_image(enhanced_crop, rot)
+                        for sc in scales:
+                            scaled_enhanced = upscale_image(rotated_enhanced, sc)
+                            recs = self._ocr.recognise_region(scaled_enhanced)
+                            for text, conf in recs:
+                                raw_detections.append({
+                                    "text": text,
+                                    "ocr_conf": conf,
+                                    "rotation": rot,
+                                    "preprocess": name,
+                                    "scale": sc,
+                                    "is_crop": True
+                                })
 
-                        pipeline = enh["pipeline"]
-                        enh_img = enh["image"]
-
-                        # Recognition crop run
-                        recs = self._ocr.recognise_region(enh_img)
-                        for text, conf in recs:
-                            raw_detections.append({
-                                "text": text,
-                                "ocr_conf": conf,
-                                "rotation": rotation,
-                                "preprocess": pipeline,
-                                "scale": scale,
-                                "is_crop": True
-                            })
-
-                # B) Fallback: Full image recognition on this rotated scale
-                fallback_recs = self._ocr.extract_all_text_with_confidences(rotated_img)
-                for text, conf in fallback_recs:
-                    raw_detections.append({
-                        "text": text,
-                        "ocr_conf": conf,
-                        "rotation": rotation,
-                        "preprocess": "FullImage",
-                        "scale": scale,
-                        "is_crop": False
-                    })
-
-                # C) Fast Escape Check: Evaluate current gathered candidates
+                # Re-evaluate fusion after this specific pipeline runs
                 det_ok, matched, highest_c, conf_map, meta_map = self._detector.detect_fused(raw_detections)
                 if det_ok and highest_c >= 0.90:
                     found_confident_match = True
@@ -238,19 +324,28 @@ class FolderWorker(QThread):
         det_ok, matched, highest_c, conf_map, meta_map = self._detector.detect_fused(raw_detections)
         duration = time.perf_counter() - start_time
 
-        if det_ok and highest_c >= OEM_CONFIDENCE_THRESHOLD:
+        # Update cache
+        cache_data = {
+            "detected": det_ok and highest_c >= OEM_CONFIDENCE_THRESHOLD,
+            "matched_numbers": matched,
+            "highest_confidence": highest_c
+        }
+        with self._cache_lock:
+            self._cache[file_hash] = cache_data
+
+        # Finalize results
+        if cache_data["detected"]:
             result["detected"] = True
             result["matched_numbers"] = matched
             result["highest_confidence"] = highest_c
 
-            # Copy file
             copied = FileService.copy_image(image_path, output_folder)
             result["copied"] = copied
             copied_status = "Copied to Number_Photos/" if copied else "Copy failed"
 
-            # Log details matching requirements
             best_num = matched[0]
-            best_pipeline, best_rotation, best_scale = meta_map.get(best_num, ("Unknown", 0, 1.0))
+            # pyrefly: ignore [bad-unpacking]
+            best_pipeline, best_rotation, best_scale = meta_map.get(best_num, ("Original", 0, 1.0))
             
             oem_lines = "\n".join(f"  - {num}" for num in matched)
             result["log"] = (
@@ -269,7 +364,20 @@ class FolderWorker(QThread):
                 f"  Processing time: {duration:.2f}s"
             )
 
+        result["duration"] = duration
         return result
+
+    def _calculate_sha256(self, filepath: Path) -> str:
+        """Calculate the SHA256 signature hash of a file."""
+        hasher = hashlib.sha256()
+        try:
+            with open(filepath, "rb") as f:
+                while chunk := f.read(8192):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as exc:
+            log.warning("Failed to compute hash for %s: %s", filepath, exc)
+            return str(filepath)
 
     # ---------------------------------------------------------------- #
     # Private helpers                                                   #

@@ -219,6 +219,11 @@ class OEMDetector:
 
             # Weights: OCR base (50%), agreement (15%), rotation (15%), preprocess (20%)
             factor_score = (ocr_base * 0.50) + (agreement_score * 0.15) + (rotation_score * 0.15) + (preprocess_score * 0.20)
+            
+            # Apply +0.20 boost for specific brand patterns to prevent false negatives on genuine parts
+            if pattern_score == 1.0:
+                factor_score += 0.20
+                
             fused_conf = pattern_score * factor_score
             fused_conf = min(max(fused_conf, 0.0), 1.0)
 
