@@ -69,5 +69,5 @@ SUPPORTED_PATTERNS: list[str] = [
     r"^\d{5}[A-Z0-9]{6}$",               # Honda (11-digit alphanumeric)
     r"^[A-Z0-9]{2,6}\d{4,6}[A-Z]{1,3}$", # Ford (e.g. 6G9112K072AD)
     r"^\d{6}$",                          # Valeo (6-digit numeric)
-    r"^[A-Z0-9]{9,12}$"                  # General fallback alphanumeric part number structure
+    r"^[A-Z0-9]{8,15}$"                  # General fallback alphanumeric part number structure
 ]

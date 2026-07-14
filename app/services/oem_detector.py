@@ -41,16 +41,49 @@ class OEMDetector:
 
     @staticmethod
     def reconstruct_oem(val: str) -> str:
-        """Perform fuzzy auto-reconstruction of missing prefix characters generally.
-        
-        This covers Mercedes-Benz, VDO/Continental, and other patterns where standard
-        leading characters (like 'A' or 'A2C') are partially erased or faint.
-        """
+        """Perform fuzzy auto-reconstruction and cleanup of prefix/suffix noise."""
         if not val:
             return val
 
-        # 1. Mercedes-Benz: 10-digit numeric string starting with Mercedes chassis code
-        # e.g. "2048601669" -> "A2048601669"
+        # 1. Strip common label prefixes (LU, HW, SW, ZB, ZP, PPT, TYP, TYPE, PART, NO, NR)
+        # Loop multiple times to handle combined prefixes (e.g. PPT LU A212...)
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ["LUA", "HWA", "SWA", "ZBA", "ZPA", "LU", "HW", "SW", "ZB", "ZP", "PPT", "TYP", "TYPE", "PART", "NO", "NR"]:
+                if prefix in ["LUA", "HWA", "SWA", "ZBA", "ZPA"]:
+                    if val.startswith(prefix):
+                        val = val[len(prefix)-1:]
+                        changed = True
+                        break
+                else:
+                    if val.startswith(prefix):
+                        val = val[len(prefix):]
+                        changed = True
+                        break
+
+        # 2. Strip common blacklisted words from start/end of the token
+        changed = True
+        while changed:
+            changed = False
+            for word in ["GERMANY", "REAR", "FRONT", "LEFT", "RIGHT", "MADE", "ORIGINAL", "OEM", "ABS", "WARRANTY", "PARTSUT", "PARTSWUT", "90DAYS"]:
+                if val.startswith(word):
+                    val = val[len(word):]
+                    changed = True
+                    break
+                if val.endswith(word):
+                    val = val[:-len(word)]
+                    changed = True
+                    break
+
+        # 3. Strip Mercedes revision/quality stand suffixes (e.g. Q1, Q2, Q01, Q02, or trailing digits after 10-digit sequence)
+        if val.startswith("A") and len(val) > 11:
+            if val[1:11].isdigit():
+                suffix = val[11:]
+                if suffix.startswith("Q") or suffix.isdigit():
+                    val = val[:11]
+
+        # 4. Perform Mercedes chassis code auto-reconstruction (e.g. "2048601669" -> "A2048601669")
         mercedes_chassis = {
             "124", "129", "140", "163", "164", "166", "168", "169", "170", "171", "172",
             "201", "202", "203", "204", "205", "207", "208", "209", "210", "211", "212",
@@ -62,8 +95,7 @@ class OEMDetector:
             if prefix in mercedes_chassis:
                 return "A" + val
 
-        # 2. VDO/Continental: 10 alphanumeric chars starting with 2C5 or 2C followed by digits
-        # e.g. "2C53420732" -> "A2C53420732"
+        # 5. VDO/Continental prefix auto-reconstruction (e.g. "2C53420732" -> "A2C53420732")
         if len(val) == 10 and val.startswith("2C"):
             if val[2].isdigit():
                 return "A" + val
@@ -91,7 +123,10 @@ class OEMDetector:
         # Try specific patterns first (Mercedes, VDO, VAG V1, VAG V2, BMW, Toyota, Honda, Ford, Valeo)
         for pattern in self._compiled_patterns[:-1]:
             if pattern.match(normalized):
-                pattern_score = 1.0
+                if pattern.pattern == r"^\d{6}$":
+                    pattern_score = 0.7
+                else:
+                    pattern_score = 1.0
                 matched_any = True
                 break
 
@@ -214,7 +249,6 @@ class OEMDetector:
 
         # ── 2. Run Confidence Fusion Scoring ───────────────────────── #
         fused_matches: list[tuple[str, float, str, int]] = []
-
         for normalized, detections in candidates_map.items():
             ocr_confs = [d["ocr_conf"] for d in detections]
             ocr_base = max(ocr_confs) if ocr_confs else 0.0
@@ -224,7 +258,11 @@ class OEMDetector:
             matched_any = False
             for pattern in self._compiled_patterns[:-1]:
                 if pattern.match(normalized):
-                    pattern_score = 1.0
+                    # Downgrade 6-digit Valeo pattern to prevent false positive boosts
+                    if pattern.pattern == r"^\d{6}$":
+                        pattern_score = 0.7
+                    else:
+                        pattern_score = 1.0
                     matched_any = True
                     break
 

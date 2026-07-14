@@ -21,7 +21,7 @@ from app.services.file_service import FileService
 from app.services.image_service import load_and_correct
 from app.services.ocr_service import OCRService
 from app.services.oem_detector import OEMDetector
-from app.utils.constants import OEM_CONFIDENCE_THRESHOLD
+from app.utils.constants import OEM_CONFIDENCE_THRESHOLD, OCR_CONFIDENCE_THRESHOLD
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -100,6 +100,15 @@ class FolderWorker(QThread):
         try:
             output_folder = FileService.ensure_output_folder(self._folder)
             self._emit_log(f"Output folder: {output_folder}")
+            
+            # Setup run-level debug logger file
+            self._debug_log_path = output_folder / "ocr_debug.txt"
+            self._debug_file_lock = threading.Lock()
+            try:
+                with open(self._debug_log_path, "w", encoding="utf-8") as f:
+                    f.write(f"=== OCR Debug Log Run started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+            except Exception as exc:
+                self._emit_log(f"WARNING: Could not create debug file ocr_debug.txt: {exc}")
         except OSError as exc:
             self._emit_log(f"ERROR creating output folder: {exc}")
             self.finished.emit(False)
@@ -230,8 +239,8 @@ class FolderWorker(QThread):
             crop_h = crop.shape[0]
             crop_w = crop.shape[1]
 
-            # Aspect ratio rotation check: test vertical rotations if vertical box
-            rotations = [90, 270] if crop_h > crop_w else [0]
+            # Aspect ratio rotation check: test vertical rotations if vertical box, or standard & upside-down if horizontal
+            rotations = [90, 270] if crop_h > crop_w else [0, 180]
             text_thickness = crop_w if crop_h > crop_w else crop_h
 
             # Single-pass smart upscaling factor depending on text thickness
@@ -302,7 +311,7 @@ class FolderWorker(QThread):
                     crop_w = crop.shape[1]
 
                     # Aspect ratio rotation check
-                    rotations = [90, 270] if crop_h > crop_w else [0]
+                    rotations = [90, 270] if crop_h > crop_w else [0, 180]
                     text_thickness = crop_w if crop_h > crop_w else crop_h
 
                     # Process enhancement
@@ -383,6 +392,72 @@ class FolderWorker(QThread):
                 f"  ✗ No OEM number detected\n"
                 f"  Processing time: {duration:.2f}s"
             )
+
+        # ── Write Diagnostic Debug Entry ───────────────────────────── #
+        try:
+            debug_lines = []
+            debug_lines.append("=" * 80)
+            debug_lines.append(f"IMAGE: {image_path.name}")
+            debug_lines.append("=" * 80)
+            debug_lines.append(f"Processing time: {duration:.2f}s")
+            
+            if cached is not None:
+                debug_lines.append("Verdict: CACHE HIT (Duplicate of a previous image)")
+            else:
+                debug_lines.append(f"Verdict: {'OEM DETECTED' if result['detected'] else 'NO OEM DETECTED'}")
+                if result['detected']:
+                    debug_lines.append(f"Matched numbers: {result['matched_numbers']} (Confidence: {result['highest_confidence']:.2f})")
+                
+                debug_lines.append("\nRaw OCR Detections:")
+                if not raw_detections:
+                    debug_lines.append("  (No text found by PaddleOCR)")
+                else:
+                    for idx, det in enumerate(raw_detections):
+                        text_raw = det["text"]
+                        conf_raw = det["ocr_conf"]
+                        rot = det["rotation"]
+                        prep = det["preprocess"]
+                        scale = det["scale"]
+                        is_crop = det["is_crop"]
+                        
+                        norm = self._detector.normalize(text_raw)
+                        reconstructed = self._detector.reconstruct_oem(norm)
+                        
+                        status = "REJECTED (No pattern match)"
+                        if conf_raw < OCR_CONFIDENCE_THRESHOLD:
+                            status = f"REJECTED (OCR Confidence too low < {OCR_CONFIDENCE_THRESHOLD})"
+                        elif self._detector.is_blacklisted(reconstructed):
+                            status = "REJECTED (Blacklisted)"
+                        elif len(reconstructed) < 3:
+                            status = "REJECTED (Too short)"
+                        else:
+                            # Test patterns
+                            matched_any = False
+                            for pattern in self._detector._compiled_patterns[:-1]:
+                                if pattern.match(reconstructed):
+                                    status = "ACCEPTED (OEM Specific Brand Pattern)"
+                                    matched_any = True
+                                    break
+                            if not matched_any:
+                                if self._detector._compiled_patterns[-1].match(reconstructed):
+                                    status = "ACCEPTED (Fallback Alphanumeric Pattern)"
+                        
+                        source = "Crop" if is_crop else "FullImage"
+                        debug_lines.append(
+                            f"  {idx+1:2d}. [{prep}, {source}, Rot {rot}°, Scale {scale}x]:\n"
+                            f"      Raw text   : \"{text_raw}\" (conf: {conf_raw:.2f})\n"
+                            f"      Normalized : \"{norm}\" -> Reconstructed: \"{reconstructed}\"\n"
+                            f"      Status     : {status}"
+                        )
+            debug_lines.append("\n\n")
+            
+            # Thread-safe write to ocr_debug.txt
+            if hasattr(self, "_debug_log_path"):
+                with self._debug_file_lock:
+                    with open(self._debug_log_path, "a", encoding="utf-8") as f:
+                        f.write("\n".join(debug_lines))
+        except Exception as exc:
+            log.warning("Failed to write to ocr_debug.txt: %s", exc)
 
         result["duration"] = duration
         return result
