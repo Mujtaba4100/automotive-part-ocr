@@ -216,7 +216,8 @@ class FolderWorker(QThread):
 
         from app.services.image_service import (
             crop_and_warp, upscale_image, enhance_clahe, sharpen_image,
-            adaptive_threshold, morphological_cleanup, denoise_image, adjust_gamma
+            adaptive_threshold, morphological_cleanup, denoise_image, adjust_gamma,
+            apply_tophat, apply_unsharp_mask
         )
 
         # ── 4. First Pass: Original Crops & Smart Upscaling ───────── #
@@ -233,23 +234,32 @@ class FolderWorker(QThread):
             rotations = [90, 270] if crop_h > crop_w else [0]
             text_thickness = crop_w if crop_h > crop_w else crop_h
 
-            # Smart upscaling: only scale small crops (thickness < 30 pixels)
-            scales = [1.0, 1.5, 2.0] if text_thickness < 30 else [1.0]
+            # Single-pass smart upscaling factor depending on text thickness
+            if text_thickness < 15:
+                scale_factor = 3.0
+            elif text_thickness < 30:
+                scale_factor = 2.0
+            else:
+                scale_factor = 1.0
 
             for rot in rotations:
                 rotated_crop = rotate_image(crop, rot)
-                for sc in scales:
-                    scaled_crop = upscale_image(rotated_crop, sc)
-                    recs = self._ocr.recognise_region(scaled_crop)
-                    for text, conf in recs:
-                        raw_detections.append({
-                            "text": text,
-                            "ocr_conf": conf,
-                            "rotation": rot,
-                            "preprocess": "Original",
-                            "scale": sc,
-                            "is_crop": True
-                        })
+                scaled_crop = upscale_image(rotated_crop, scale_factor)
+                
+                # Apply edge sharpening to upscaled crops to clarify blurred fonts
+                if scale_factor > 1.0:
+                    scaled_crop = apply_unsharp_mask(scaled_crop)
+
+                recs = self._ocr.recognise_region(scaled_crop)
+                for text, conf in recs:
+                    raw_detections.append({
+                        "text": text,
+                        "ocr_conf": conf,
+                        "rotation": rot,
+                        "preprocess": "Original",
+                        "scale": scale_factor,
+                        "is_crop": True
+                    })
 
         # Run Fallback: Full base image OCR
         if not self._cancel_requested:
@@ -271,9 +281,10 @@ class FolderWorker(QThread):
 
         # ── 5. Second Pass: Lazy Preprocessing Pipelines ─────────────── #
         if not found_confident_match and not self._cancel_requested:
-            # We try the 3 most effective enhancements one-by-one: CLAHE, Sharpen, Thresholded
+            # We try the 4 most effective enhancements one-by-one: CLAHE, Top-Hat, Sharpen, Thresholded
             enhancement_types = [
                 ("CLAHE", lambda c: enhance_clahe(c)),
+                ("TopHat", lambda c: apply_tophat(c)),
                 ("Sharpened", lambda c: sharpen_image(c)),
                 ("Thresholded", lambda c: morphological_cleanup(adaptive_threshold(c)))
             ]
@@ -297,22 +308,31 @@ class FolderWorker(QThread):
                     # Process enhancement
                     enhanced_crop = pipeline_func(crop)
                     
-                    # Scale if necessary
-                    scales = [1.0, 1.5, 2.0] if text_thickness < 30 else [1.0]
+                    # Single-pass smart upscaling factor
+                    if text_thickness < 15:
+                        scale_factor = 3.0
+                    elif text_thickness < 30:
+                        scale_factor = 2.0
+                    else:
+                        scale_factor = 1.0
+
                     for rot in rotations:
                         rotated_enhanced = rotate_image(enhanced_crop, rot)
-                        for sc in scales:
-                            scaled_enhanced = upscale_image(rotated_enhanced, sc)
-                            recs = self._ocr.recognise_region(scaled_enhanced)
-                            for text, conf in recs:
-                                raw_detections.append({
-                                    "text": text,
-                                    "ocr_conf": conf,
-                                    "rotation": rot,
-                                    "preprocess": name,
-                                    "scale": sc,
-                                    "is_crop": True
-                                })
+                        scaled_enhanced = upscale_image(rotated_enhanced, scale_factor)
+                        
+                        if scale_factor > 1.0:
+                            scaled_enhanced = apply_unsharp_mask(scaled_enhanced)
+
+                        recs = self._ocr.recognise_region(scaled_enhanced)
+                        for text, conf in recs:
+                            raw_detections.append({
+                                "text": text,
+                                "ocr_conf": conf,
+                                "rotation": rot,
+                                "preprocess": name,
+                                "scale": scale_factor,
+                                "is_crop": True
+                            })
 
                 # Re-evaluate fusion after this specific pipeline runs
                 det_ok, matched, highest_c, conf_map, meta_map = self._detector.detect_fused(raw_detections)

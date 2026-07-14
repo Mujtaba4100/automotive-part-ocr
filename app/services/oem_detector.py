@@ -39,6 +39,37 @@ class OEMDetector:
         # Keep only A-Z and 0-9
         return re.sub(r"[^A-Z0-9]", "", val)
 
+    @staticmethod
+    def reconstruct_oem(val: str) -> str:
+        """Perform fuzzy auto-reconstruction of missing prefix characters generally.
+        
+        This covers Mercedes-Benz, VDO/Continental, and other patterns where standard
+        leading characters (like 'A' or 'A2C') are partially erased or faint.
+        """
+        if not val:
+            return val
+
+        # 1. Mercedes-Benz: 10-digit numeric string starting with Mercedes chassis code
+        # e.g. "2048601669" -> "A2048601669"
+        mercedes_chassis = {
+            "124", "129", "140", "163", "164", "166", "168", "169", "170", "171", "172",
+            "201", "202", "203", "204", "205", "207", "208", "209", "210", "211", "212",
+            "213", "215", "216", "218", "219", "220", "221", "222", "230", "231", "245",
+            "246", "251", "463", "639", "906"
+        }
+        if len(val) == 10 and val.isdigit():
+            prefix = val[:3]
+            if prefix in mercedes_chassis:
+                return "A" + val
+
+        # 2. VDO/Continental: 10 alphanumeric chars starting with 2C5 or 2C followed by digits
+        # e.g. "2C53420732" -> "A2C53420732"
+        if len(val) == 10 and val.startswith("2C"):
+            if val[2].isdigit():
+                return "A" + val
+
+        return val
+
     def is_blacklisted(self, normalized_text: str) -> bool:
         """Return True if the normalized candidate is present in the blacklist."""
         if not normalized_text:
@@ -119,6 +150,7 @@ class OEMDetector:
                     continue
 
                 normalized = self.normalize(token_clean)
+                normalized = self.reconstruct_oem(normalized)
                 conf = self.calculate_confidence(normalized, ocr_conf)
 
                 if conf >= OEM_CONFIDENCE_THRESHOLD:
@@ -172,6 +204,7 @@ class OEMDetector:
                     continue
 
                 normalized = self.normalize(token_clean)
+                normalized = self.reconstruct_oem(normalized)
                 if self.is_blacklisted(normalized) or len(normalized) < 3:
                     continue
 

@@ -330,6 +330,33 @@ def upscale_image(image: np.ndarray, scale: float) -> np.ndarray:
         return image
 
 
+def apply_tophat(image: np.ndarray) -> np.ndarray:
+    """Apply Morphological Top-Hat filtering to isolate raised molded text."""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+        enhanced = cv2.add(gray, tophat)
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    except Exception as exc:
+        log.warning("Top-Hat filter failed: %s", exc)
+        return image
+
+
+def apply_unsharp_mask(image: np.ndarray, amount: float = 1.5, threshold: int = 0) -> np.ndarray:
+    """Apply unsharp masking to reconstruct sharp character edges for small/blurred crops."""
+    try:
+        gaussian_3 = cv2.GaussianBlur(image, (3, 3), 0)
+        sharp = cv2.addWeighted(image, 1.0 + amount, gaussian_3, -amount, 0)
+        if threshold > 0:
+            low_contrast_mask = np.abs(image - gaussian_3) < threshold
+            np.copyto(sharp, image, where=low_contrast_mask)
+        return sharp
+    except Exception as exc:
+        log.warning("Unsharp masking failed: %s", exc)
+        return image
+
+
 def get_advanced_enhancements(crop: np.ndarray) -> list[dict[str, object]]:
     """Generate multiple preprocessed variations of a cropped text region.
     
@@ -348,20 +375,27 @@ def get_advanced_enhancements(crop: np.ndarray) -> list[dict[str, object]]:
     # 3. Sharpened
     enhancements.append({"pipeline": "Sharpened", "image": sharpen_image(crop)})
 
-    # 4. Bilateral Denoised
-    enhancements.append({"pipeline": "BilateralFilter", "image": denoise_image(crop)})
+    # 4. Top-Hat (Molded plastic raised text contrast enhancer)
+    enhancements.append({"pipeline": "TopHat", "image": apply_tophat(crop)})
 
-    # 5. Brightness Normalized
-    enhancements.append({"pipeline": "Normalised", "image": normalize_brightness(crop)})
+    # 5. Unsharp Mask (Edge sharpening)
+    enhancements.append({"pipeline": "Unsharp", "image": apply_unsharp_mask(crop)})
 
     # 6. Adaptive Threshold (Binarized + Morphology)
     thresh = morphological_cleanup(adaptive_threshold(crop))
     enhancements.append({"pipeline": "Thresholded", "image": thresh})
 
-    # 7. Gamma Corrected (High contrast / shadow recovery)
+    # 7. Bilateral Denoised
+    enhancements.append({"pipeline": "BilateralFilter", "image": denoise_image(crop)})
+
+    # 8. Brightness Normalized
+    enhancements.append({"pipeline": "Normalised", "image": normalize_brightness(crop)})
+
+    # 9. Gamma Corrected
     enhancements.append({"pipeline": "GammaHigh", "image": adjust_gamma(crop, 1.5)})
     enhancements.append({"pipeline": "GammaLow", "image": adjust_gamma(crop, 0.6)})
 
     return enhancements
+
 
 
